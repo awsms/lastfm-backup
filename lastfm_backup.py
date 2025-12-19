@@ -95,9 +95,9 @@ def get_loved_tracks(username, api_key, page):
 # I/O helpers
 
 def save_json(data, filename):
-    """Write a Python obj as pretty JSON."""
+    """Write a Python obj as compact JSON."""
     with open(filename, "w", encoding="utf8") as f:
-        json.dump(data, f, indent=4, sort_keys=True, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
 
 
 def save_partial_scrobbles(tracks, filename=SCROBBLES_FILE):
