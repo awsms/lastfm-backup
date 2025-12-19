@@ -6,8 +6,7 @@ import urllib.request
 from sys import stdout, stderr
 import logging
 import os
-
-import backoff
+import time
 
 __author__ = 'Alexander Popov'
 __version__ = '1.2.0'
@@ -21,30 +20,56 @@ FAVOURITES_FILE = "favourites.json"
 
 # API helpers
 
-def _get(url):
-    """Simple helper to GET and decode JSON."""
-    resp = urllib.request.urlopen(url).read().decode("utf8")
-    return json.loads(resp)
+def _get(url, max_attempts=5):
+    """Simple helper to GET and decode JSON with basic retries."""
+    delay = 1
+    last_exc = None
+    for _ in range(max_attempts):
+        try:
+            resp = urllib.request.urlopen(url).read().decode("utf8")
+            return json.loads(resp)
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Request failed for URL: %s" % url)
 
 
-def get_pages(username, api_key):
+def _format_ts(ts):
+    """Return a human-friendly UTC string for a unix timestamp."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(ts)))
+    except Exception:
+        return str(ts)
+
+
+def _build_recent_url(username, api_key, page=None, from_ts=None, to_ts=None):
+    query_parts = [
+        "method=user.getrecenttracks",
+        "user={0}".format(username),
+        "api_key={0}".format(api_key),
+        "format=json",
+        "limit=200",
+    ]
+    if page is not None:
+        query_parts.append("page={0}".format(page))
+    if from_ts:
+        query_parts.append("from={0}".format(int(from_ts)))
+    if to_ts:
+        query_parts.append("to={0}".format(int(to_ts)))
+    return "https://ws.audioscrobbler.com/2.0/?" + "&".join(query_parts)
+
+
+def get_pages(username, api_key, from_ts=None, to_ts=None):
     """Total pages for recent tracks (scrobbles)."""
-    data = _get(
-        'https://ws.audioscrobbler.com/2.0/'
-        '?method=user.getrecenttracks&user={0}&api_key={1}&format=json'
-        '&limit=200'.format(username, api_key)
-    )
+    data = _get(_build_recent_url(username, api_key, from_ts=from_ts, to_ts=to_ts))
     return int(data['recenttracks']['@attr']['totalPages'])
 
 
-# http://www.last.fm/api/show/user.getRecentTracks
-@backoff.on_exception(backoff.expo, urllib.error.HTTPError, max_time=60 * 60)
-def get_scrobbles(username, api_key, page):
-    data = _get(
-        'https://ws.audioscrobbler.com/2.0/'
-        '?method=user.getrecenttracks&user={0}&api_key={1}&format=json'
-        '&limit=200&page={2}'.format(username, api_key, page)
-    )
+def get_scrobbles(username, api_key, page, from_ts=None, to_ts=None):
+    data = _get(_build_recent_url(username, api_key, page=page, from_ts=from_ts, to_ts=to_ts))
     return data['recenttracks']['track']
 
 
@@ -58,7 +83,6 @@ def get_loved_pages(username, api_key):
     return int(data['lovedtracks']['@attr']['totalPages'])
 
 
-@backoff.on_exception(backoff.expo, urllib.error.HTTPError, max_time=60 * 60)
 def get_loved_tracks(username, api_key, page):
     data = _get(
         'https://ws.audioscrobbler.com/2.0/'
@@ -81,13 +105,14 @@ def save_partial_scrobbles(tracks, filename=SCROBBLES_FILE):
     save_json(tracks, filename)
 
 
-def save_state(username, last_page, total_pages, tracks_count, filename=STATE_FILE):
+def save_state(username, last_page, total_pages, tracks_count, resume_to_ts=None, filename=STATE_FILE):
     """Save progress info so we can resume later."""
     state = {
         "username": username,
         "last_page": last_page,
         "total_pages": total_pages,
         "tracks_count": tracks_count,
+        "resume_to_ts": resume_to_ts,
     }
     with open(filename, "w", encoding="utf8") as f:
         json.dump(state, f, indent=4, sort_keys=True)
@@ -156,61 +181,72 @@ if __name__ == '__main__':
     else:
         stderr.write("Favourites file exists, skipping favourites download.\n")
 
-    # then scrobbles
+    # then scrobbles (timestamp-based resume)
     stderr.write("Fetching scrobbles…\n")
-    total = get_pages(username, api_key)
 
-    # try to resume from previous state
-    state = load_state(username)
+    state = load_state(username) or {}
     tracks = []
-    start_page = 1
+    seen = set()
+    resume_to_ts = None
 
-    if state and os.path.exists(SCROBBLES_FILE):
-        last_page = state.get("last_page", 0)
-        tracks_count = state.get("tracks_count", 0)
-
-        if 0 < last_page < total:
-            # load existing tracks from previous run
-            try:
-                with open(SCROBBLES_FILE, "r", encoding="utf8") as f:
-                    tracks = json.load(f)
-                if len(tracks) == tracks_count:
-                    start_page = last_page + 1
-                    stderr.write(
-                        "Resuming from page %d (previously completed up to page %d, %d tracks).\n"
-                        % (start_page, last_page, tracks_count)
-                    )
-                else:
-                    stderr.write(
-                        "State file and scrobbles.json mismatch; starting from scratch.\n"
-                    )
-            except Exception:
-                stderr.write("Could not load existing scrobbles; starting from scratch.\n")
-        else:
-            stderr.write("Previous state indicates all pages or invalid; starting from scratch.\n")
+    if os.path.exists(SCROBBLES_FILE):
+        try:
+            with open(SCROBBLES_FILE, "r", encoding="utf8") as f:
+                tracks = json.load(f)
+            for t in tracks:
+                key = (
+                    t.get('artist'),
+                    t.get('name'),
+                    t.get('album'),
+                    t.get('date'),
+                )
+                seen.add(key)
+            if tracks and tracks[-1].get('date'):
+                resume_to_ts = int(tracks[-1]['date']) - 1
+                stderr.write(
+                    "Resuming scrobble download; already have %d tracks down to %s (%s).\n"
+                    % (len(tracks), tracks[-1]['date'], _format_ts(tracks[-1]['date']))
+                )
+            else:
+                stderr.write("Existing scrobbles.json found but missing dates; starting fresh.\n")
+                tracks = []
+                seen = set()
+        except Exception:
+            stderr.write("Could not load existing scrobbles; starting from scratch.\n")
+            tracks = []
+            seen = set()
     else:
-        stderr.write("No previous state found; starting from scratch.\n")
+        stderr.write("No previous scrobbles found; starting from scratch.\n")
 
-    if not tracks:
-        tracks = []
+    total = get_pages(username, api_key, to_ts=resume_to_ts)
 
-    curPage = start_page
+    cur_page = 1
     outfile = SCROBBLES_FILE
 
-    while curPage <= total:
+    while cur_page <= total:
         stderr.write('\rpage %d/%d %d%%' %
-                     (curPage, total, curPage * 100 / total))
+                     (cur_page, total, cur_page * 100 / total))
 
-        response = get_scrobbles(username, api_key, curPage)
+        response = get_scrobbles(username, api_key, cur_page, to_ts=resume_to_ts)
 
         for track in response:
             try:
+                key = (
+                    track['artist']['#text'],
+                    track['name'],
+                    track['album']['#text'],
+                    track['date']['uts'],
+                )
+                if key in seen:
+                    continue
+
                 tracks.append({
                     'artist': track['artist']['#text'],
                     'name': track['name'],
                     'album': track['album']['#text'],
                     'date': track['date']['uts'],
                 })
+                seen.add(key)
             except Exception as e:
                 if 'nowplaying' in str(track):
                     # currently playing: no date yet
@@ -220,11 +256,13 @@ if __name__ == '__main__':
                     raise e
 
         # checkpoint every 10 pages or on the last page
-        if (curPage % 10 == 0) or (curPage == total):
+        if (cur_page % 10 == 0) or (cur_page == total):
+            newest_to_oldest = tracks
+            oldest_ts = int(newest_to_oldest[-1]['date']) if newest_to_oldest else None
             save_partial_scrobbles(tracks, outfile)
-            save_state(username, curPage, total, len(tracks))
+            save_state(username, cur_page, total, len(tracks), oldest_ts)
 
-        curPage += 1
+        cur_page += 1
 
     stderr.write("\nScrobbles saved to %s (%d items)\n" %
                  (outfile, len(tracks)))
