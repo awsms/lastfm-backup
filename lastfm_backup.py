@@ -218,6 +218,8 @@ if __name__ == '__main__':
     else:
         stderr.write("No previous scrobbles found; starting from scratch.\n")
 
+    outfile = SCROBBLES_FILE
+
     # always refresh newest scrobbles first to capture new activity
     new_tracks = []
     refresh_page = 1
@@ -263,6 +265,14 @@ if __name__ == '__main__':
         stderr.write("\nAdded %d new scrobbles at the top.\n" % len(new_tracks))
         tracks = new_tracks + tracks
 
+        # persist even if we won't download older pages
+        save_partial_scrobbles(tracks, outfile := SCROBBLES_FILE)
+
+        # update state too
+        oldest_ts = int(tracks[-1]['date']) if tracks and tracks[-1].get('date') else None
+        save_state(username, last_page=0, total_pages=0, tracks_count=len(tracks), resume_to_ts=oldest_ts)
+
+
     # now continue older pages based on the oldest timestamp we have
     if tracks and tracks[-1].get('date'):
         resume_to_ts = int(tracks[-1]['date']) - 1
@@ -274,8 +284,12 @@ if __name__ == '__main__':
     if state.get("resume_to_ts") == resume_to_ts and state.get("last_page", 0) < total:
         start_page = state.get("last_page", 0) + 1
 
+    # ensure newly fetched scrobbles are persisted even before continuing older pages
+    if new_tracks:
+        save_partial_scrobbles(tracks, outfile)
+        save_state(username, 0, total, len(tracks), resume_to_ts)
+
     cur_page = start_page
-    outfile = SCROBBLES_FILE
 
     while cur_page <= total:
         stderr.write('\rpage %d/%d %d%%' %
