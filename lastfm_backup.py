@@ -218,9 +218,63 @@ if __name__ == '__main__':
     else:
         stderr.write("No previous scrobbles found; starting from scratch.\n")
 
-    total = get_pages(username, api_key, to_ts=resume_to_ts)
+    # always refresh newest scrobbles first to capture new activity
+    new_tracks = []
+    refresh_page = 1
+    while True:
+        response = get_scrobbles(username, api_key, refresh_page)
+        if not response:
+            break
 
-    cur_page = 1
+        encountered_existing = False
+        page_added = 0
+
+        for track in response:
+            try:
+                key = (
+                    track['artist']['#text'],
+                    track['name'],
+                    track['album']['#text'],
+                    track['date']['uts'],
+                )
+                if key in seen:
+                    encountered_existing = True
+                    break
+
+                record = {
+                    'artist': track['artist']['#text'],
+                    'name': track['name'],
+                    'album': track['album']['#text'],
+                    'date': track['date']['uts'],
+                }
+                new_tracks.append(record)
+                seen.add(key)
+                page_added += 1
+            except Exception:
+                # skip nowplaying tracks that have no date
+                continue
+
+        if encountered_existing or page_added == 0 or len(response) < 200:
+            break
+
+        refresh_page += 1
+
+    if new_tracks:
+        stderr.write("\nAdded %d new scrobbles at the top.\n" % len(new_tracks))
+        tracks = new_tracks + tracks
+
+    # now continue older pages based on the oldest timestamp we have
+    if tracks and tracks[-1].get('date'):
+        resume_to_ts = int(tracks[-1]['date']) - 1
+    else:
+        resume_to_ts = None
+
+    total = get_pages(username, api_key, to_ts=resume_to_ts)
+    start_page = 1
+    if state.get("resume_to_ts") == resume_to_ts and state.get("last_page", 0) < total:
+        start_page = state.get("last_page", 0) + 1
+
+    cur_page = start_page
     outfile = SCROBBLES_FILE
 
     while cur_page <= total:
