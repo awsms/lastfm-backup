@@ -6,7 +6,7 @@
 --------------
 * [Get](http://www.last.fm/api/account/create) API Key.
 * Stop scrobbling!
-* Rename `config.json.example` to `config.json` and edit.
+** Rename `config.py.example` to `config.py` and edit.*
 * Run script `lastfm_backup.py`.
 * WAIT!!
 
