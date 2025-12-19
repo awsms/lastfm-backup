@@ -9,7 +9,7 @@ import os
 import time
 
 __author__ = 'Alexander Popov'
-__version__ = '1.3.0'
+__version__ = '1.3.1'
 __license__ = 'Unlicense'
 
 
